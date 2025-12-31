@@ -7,6 +7,8 @@ import numpy as np
 import cv2
 import select
 import gc
+import argparse
+import sys
 
 # --- Constants ---
 SOCKET_PATH = '\0/com/obsproject/vkcapture'
@@ -27,7 +29,65 @@ def dma_sync(fd, flags):
     except OSError:
         pass
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="View obs-vkcapture output, optionally split into regions.")
+    parser.add_argument(
+        '-r', '--region',
+        action='append',
+        help='Define a region window in format x,y,w,h (e.g., -r 0,0,1920,1080). Can be used multiple times.'
+    )
+    return parser.parse_args()
+
+def cleanup_views(raw, img, crop, mapped_buf, fd):
+    """
+    Helper to safely destroy numpy views and close buffers.
+    Must completely release buffer references before closing mmap.
+    """
+    # 1. Delete NumPy views
+    # Assigning None drops the reference
+    crop = None
+    img = None
+    raw = None
+
+    # 2. Force Garbage Collection
+    # This ensures the buffer exports in C-land are actually released
+    # so that mmap can be closed without BufferError.
+    del crop
+    del img
+    del raw
+    gc.collect()
+
+    # 3. Close Map and FD
+    if mapped_buf:
+        try:
+            mapped_buf.close()
+        except (ValueError, BufferError):
+            pass
+
+    if fd:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    return None, None, None, None, None # return Nones to reset state vars
+
 def main():
+    args = parse_arguments()
+
+    # Parse regions
+    regions = []
+    if args.region:
+        for r_str in args.region:
+            try:
+                x, y, w, h = map(int, r_str.split(','))
+                regions.append({'x': x, 'y': y, 'w': w, 'h': h})
+            except ValueError:
+                print(f"Error: Invalid region format '{r_str}'. Expected x,y,w,h")
+                sys.exit(1)
+
+    show_full_window = len(regions) == 0
+
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.setblocking(False)
     try:
@@ -36,7 +96,13 @@ def main():
         print(f"Error binding socket: {e}")
         return
     server.listen(1)
-    print("Viewer started. Waiting for game...")
+
+    print(f"Viewer started.")
+    if show_full_window:
+        print("Mode: Full Capture")
+    else:
+        print(f"Mode: {len(regions)} Custom Region(s)")
+    print("Waiting for game...")
 
     # State variables
     conn = None
@@ -44,9 +110,10 @@ def main():
     current_fd = None
     width, height, stride = 0, 0, 0
 
-    # We must track these views to delete them before closing the buffer
+    # Views (Must be tracked to prevent BufferErrors on resize)
     raw = None
     img = None
+    crop = None
 
     try:
         while True:
@@ -65,25 +132,7 @@ def main():
                     # Clean up previous connection completely
                     if conn:
                         conn.close()
-
-                        # 1. Release Views
-                        raw = None
-                        img = None
-                        del raw
-                        del img
-                        gc.collect()
-
-                        # 2. Close Map and FD
-                        if mapped_buf:
-                            try: mapped_buf.close()
-                            except ValueError: pass
-
-                        if current_fd:
-                            os.close(current_fd)
-
-                        # 3. CRITICAL FIX: Reset state variables to None
-                        mapped_buf = None
-                        current_fd = None
+                        raw, img, crop, mapped_buf, current_fd = cleanup_views(raw, img, crop, mapped_buf, current_fd)
                         width, height = 0, 0
 
                     conn = new_conn
@@ -105,23 +154,7 @@ def main():
                             print("Game disconnected.")
                             conn.close()
                             conn = None
-
-                            # Clean up
-                            raw = None
-                            img = None
-                            del raw
-                            del img
-                            gc.collect()
-
-                            if mapped_buf:
-                                try: mapped_buf.close()
-                                except ValueError: pass
-
-                            if current_fd:
-                                os.close(current_fd)
-
-                            mapped_buf = None
-                            current_fd = None
+                            raw, img, crop, mapped_buf, current_fd = cleanup_views(raw, img, crop, mapped_buf, current_fd)
                             width, height = 0, 0
                             continue
 
@@ -136,54 +169,72 @@ def main():
 
                             if fds:
                                 # --- RESIZE EVENT ---
-                                if current_fd: os.close(current_fd)
+                                # 1. Close old FD/Map first (must release views first)
+                                if current_fd:
+                                    os.close(current_fd)
+                                    current_fd = None
 
-                                raw = None
-                                img = None
-                                del raw
-                                del img
-                                gc.collect()
+                                # Explicit cleanup of numpy views before re-mapping
+                                raw, img, crop, mapped_buf, _ = cleanup_views(raw, img, crop, mapped_buf, None)
 
-                                if mapped_buf:
-                                    try: mapped_buf.close()
-                                    except ValueError: pass
-                                mapped_buf = None # Reset strictly
-
+                                # 2. Map new FD
                                 current_fd = fds[0]
-                                size = os.lseek(current_fd, 0, os.SEEK_END)
-                                os.lseek(current_fd, 0, os.SEEK_SET)
-                                mapped_buf = mmap.mmap(current_fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
-
-                                width, height, stride = new_w, new_h, new_stride
-                                print(f"Texture update: {width}x{height} (FD: {current_fd})")
+                                try:
+                                    size = os.lseek(current_fd, 0, os.SEEK_END)
+                                    os.lseek(current_fd, 0, os.SEEK_SET)
+                                    mapped_buf = mmap.mmap(current_fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+                                    width, height, stride = new_w, new_h, new_stride
+                                    print(f"Texture update: {width}x{height}")
+                                except OSError as e:
+                                    print(f"Failed to map new texture: {e}")
+                                    if current_fd: os.close(current_fd)
+                                    current_fd = None
 
                     except (ConnectionResetError, BrokenPipeError):
                         print("Connection lost.")
                         conn.close()
                         conn = None
-                        mapped_buf = None
+                        raw, img, crop, mapped_buf, current_fd = cleanup_views(raw, img, crop, mapped_buf, current_fd)
 
             # --- RENDER FRAME ---
-            # Now safe because mapped_buf is None if we are between games
             if conn and mapped_buf and width > 0 and height > 0:
                 try:
                     dma_sync(current_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
 
+                    # Re-create raw view every frame (cheap) to ensure validity
                     raw = np.frombuffer(mapped_buf, dtype=np.uint8)
                     expected_size = stride * height
 
                     if raw.size >= expected_size:
+                        # Construct main image view
                         img = raw[:expected_size].reshape((height, stride))
                         img = img[:, :width*4]
                         img = img.reshape((height, width, 4))
-                        img = img[..., [2, 1, 0, 3]]
 
-                        cv2.imshow("OBS VkCapture Output", img)
+                        # Note: Vulkan capture is usually BGRA. OpenCV expects BGR(A).
+                        # No conversion needed usually.
+
+                        if show_full_window:
+                            cv2.imshow("OBS VkCapture - Full", img)
+                        else:
+                            for idx, reg in enumerate(regions):
+                                rx, ry, rw, rh = reg['x'], reg['y'], reg['w'], reg['h']
+
+                                # Bounds Checking
+                                start_y = max(0, min(ry, height))
+                                end_y = max(0, min(ry + rh, height))
+                                start_x = max(0, min(rx, width))
+                                end_x = max(0, min(rx + rw, width))
+
+                                if end_x > start_x and end_y > start_y:
+                                    # Create the view
+                                    crop = img[start_y:end_y, start_x:end_x]
+                                    cv2.imshow(f"Region {idx+1} ({rx},{ry})", crop)
 
                     dma_sync(current_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ)
 
                 except ValueError:
-                    # Handle resize race conditions
+                    # Handle resize race conditions (buffer size mismatch)
                     pass
                 except OSError:
                     pass
@@ -196,16 +247,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # Final Cleanup
-        raw = None
-        img = None
-        del raw
-        del img
-        gc.collect()
-        if mapped_buf:
-            try: mapped_buf.close()
-            except ValueError: pass
-        if current_fd: os.close(current_fd)
+        cleanup_views(raw, img, crop, mapped_buf, current_fd)
         if conn: conn.close()
         server.close()
         cv2.destroyAllWindows()
